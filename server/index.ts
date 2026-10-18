@@ -196,8 +196,17 @@ async function protectBrowser(page: Page): Promise<() => ScanError | undefined> 
   return () => blockedNavigation;
 }
 
+let cachedAxeSource: string | null = null;
+async function getAxeSource(): Promise<string> {
+  if (!cachedAxeSource) {
+    cachedAxeSource = await readFile(axeScript, 'utf8');
+  }
+  return cachedAxeSource;
+}
+
 async function runAxe(page: Page): Promise<AxeResults> {
-  await page.addScriptTag({ path: axeScript });
+  const source = await getAxeSource();
+  await page.evaluate(source);
   return page.evaluate(async () => {
     const axeApi = (window as Window & { axe?: { run: () => Promise<AxeResults> } }).axe;
     if (!axeApi) throw new Error('axe-core was not available in the page.');
@@ -221,12 +230,30 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
     });
     const context = await browser.newContext({
       serviceWorkers: 'block',
-      ignoreHTTPSErrors: false,
+      ignoreHTTPSErrors: true,
+      bypassCSP: true,
       javaScriptEnabled: true,
     });
     const page = await context.newPage();
     page.setDefaultNavigationTimeout(navigationTimeoutMs);
     page.setDefaultTimeout(10_000);
+
+    // Bypass Trusted Types restrictions on strict CSP websites (e.g. YouTube)
+    await page.addInitScript(() => {
+      const win = window as unknown as { trustedTypes?: { createPolicy: (name: string, rules: Record<string, (s: string) => string>) => void } };
+      if (win.trustedTypes && win.trustedTypes.createPolicy) {
+        try {
+          win.trustedTypes.createPolicy('default', {
+            createHTML: (s: string) => s,
+            createScript: (s: string) => s,
+            createScriptURL: (s: string) => s,
+          });
+        } catch {
+          // ignore if policy exists
+        }
+      }
+    });
+
     const getBlockedNavigation = await protectBrowser(page);
     try {
       await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
@@ -293,9 +320,12 @@ app.post('/api/scan', async (request, response) => {
     const url = validateUrlSyntax(request.body?.url);
     response.json(await scanWebsite(url));
   } catch (error) {
+    console.error('Scan error:', error);
     const known = error instanceof ScanError;
     const status = known ? error.status : 500;
-    const message = known ? error.message : 'The scan could not be completed. Please try again.';
+    const message = known
+      ? error.message
+      : (error instanceof Error ? error.message : 'The scan could not be completed. Please try again.');
     response.status(status).json({ error: message });
   }
 });
