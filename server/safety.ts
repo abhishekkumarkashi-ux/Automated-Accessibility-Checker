@@ -91,6 +91,9 @@ function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
   });
 }
 
+const dnsCache = new Map<string, { expiresAt: number; error?: ScanError }>();
+const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+
 export async function validatePublicDestination(url: URL): Promise<void> {
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   const literalVersion = net.isIP(hostname);
@@ -99,17 +102,33 @@ export async function validatePublicDestination(url: URL): Promise<void> {
     return;
   }
 
+  const now = Date.now();
+  const cached = dnsCache.get(hostname);
+  if (cached && cached.expiresAt > now) {
+    if (cached.error) throw cached.error;
+    return;
+  }
+
   let addresses: Array<{ address: string; family: number }>;
   try {
     addresses = await withTimeout(dns.lookup(hostname, { all: true, verbatim: true }), 5000);
   } catch (error) {
-    if (error instanceof ScanError) throw error;
-    throw new ScanError('The website host could not be resolved. Check the URL and try again.', 400);
+    const err = error instanceof ScanError ? error : new ScanError('The website host could not be resolved. Check the URL and try again.', 400);
+    dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS, error: err });
+    throw err;
   }
-  if (addresses.length === 0) throw new ScanError('The website host does not have a public address.');
+  if (addresses.length === 0) {
+    const err = new ScanError('The website host does not have a public address.');
+    dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS, error: err });
+    throw err;
+  }
   if (addresses.some(({ address }) => !isPublicIp(address))) {
-    throw new ScanError('This website resolves to a private or reserved network address and cannot be scanned.');
+    const err = new ScanError('This website resolves to a private or reserved network address and cannot be scanned.');
+    dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS, error: err });
+    throw err;
   }
+
+  dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS });
 }
 
 export function getPublicSuffixHost(url: URL): string {

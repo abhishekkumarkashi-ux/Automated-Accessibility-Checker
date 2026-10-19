@@ -8,9 +8,9 @@ import { ScanError, validatePublicDestination, validateUrlSyntax } from './safet
 
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
-const requestTimeoutMs = 30_000;
-const scanTimeoutMs = 25_000;
-const navigationTimeoutMs = 20_000;
+const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS ?? 65_000);
+const scanTimeoutMs = Number(process.env.SCAN_TIMEOUT_MS ?? 55_000);
+const navigationTimeoutMs = Number(process.env.NAVIGATION_TIMEOUT_MS ?? 35_000);
 const maxRedirects = 8;
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
 const demoPath = path.join(serverDirectory, 'demo.html');
@@ -154,6 +154,14 @@ async function protectBrowser(page: Page): Promise<() => ScanError | undefined> 
   await page.route('**/*', async (route) => {
     const request = route.request();
     const rawUrl = request.url();
+    const resourceType = request.resourceType();
+
+    // Abort heavy media streams (video/audio) to save memory, bandwidth, and CPU
+    if (resourceType === 'media') {
+      await route.abort('blockedbyclient');
+      return;
+    }
+
     let target: URL;
     try {
       target = new URL(rawUrl);
@@ -208,9 +216,9 @@ async function runAxe(page: Page): Promise<AxeResults> {
   const source = await getAxeSource();
   await page.evaluate(source);
   return page.evaluate(async () => {
-    const axeApi = (window as Window & { axe?: { run: () => Promise<AxeResults> } }).axe;
+    const axeApi = (window as Window & { axe?: { run: (context?: unknown, options?: unknown) => Promise<AxeResults> } }).axe;
     if (!axeApi) throw new Error('axe-core was not available in the page.');
-    return axeApi.run();
+    return axeApi.run(document, { iframes: false });
   });
 }
 
@@ -225,18 +233,30 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
     await validatePublicDestination(url);
     browser = await chromium.launch({
       headless: true,
-      timeout: 10_000,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      timeout: 15_000,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--mute-audio',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-extensions',
+      ],
     });
     const context = await browser.newContext({
       serviceWorkers: 'block',
       ignoreHTTPSErrors: true,
       bypassCSP: true,
       javaScriptEnabled: true,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      viewport: { width: 1280, height: 800 },
     });
     const page = await context.newPage();
     page.setDefaultNavigationTimeout(navigationTimeoutMs);
-    page.setDefaultTimeout(10_000);
+    page.setDefaultTimeout(15_000);
 
     // Bypass Trusted Types restrictions on strict CSP websites (e.g. YouTube)
     await page.addInitScript(() => {
@@ -257,6 +277,8 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
     const getBlockedNavigation = await protectBrowser(page);
     try {
       await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
+      // Brief pause for initial dynamic DOM hydration
+      await page.waitForTimeout(500);
     } catch (error) {
       const blockedNavigation = getBlockedNavigation();
       if (blockedNavigation) throw blockedNavigation;
