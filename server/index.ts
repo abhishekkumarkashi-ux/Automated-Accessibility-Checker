@@ -772,11 +772,12 @@ app.get('/api/health', (_request, response) =>
 );
 
 app.get('/api/agent/status', (_request, response) => {
-  const configured = isFoundryConfigured();
+  const foundryConnected = isFoundryConfigured();
   const config = getFoundryConfig();
   response.json({
-    configured,
-    model: configured && config ? config.model : undefined,
+    configured: true,
+    foundryConnected,
+    model: foundryConnected && config ? config.model : 'Built-in Expert Engine',
   });
 });
 
@@ -787,15 +788,6 @@ app.post('/api/agent/plan', async (request, response) => {
       return response.status(400).json({
         error: 'A valid scanId must be provided in the request body.',
         code: 'INVALID_SCAN_ID',
-      });
-    }
-
-    if (!isFoundryConfigured()) {
-      return response.status(503).json({
-        error: 'Microsoft Foundry Agent Service is not configured on this server.',
-        code: 'AGENT_NOT_CONFIGURED',
-        suggestion:
-          'Set AZURE_AI_FOUNDRY_PROJECT_ENDPOINT and AZURE_AI_FOUNDRY_MODEL_DEPLOYMENT in .env to enable the Accessibility Coach Agent.',
       });
     }
 

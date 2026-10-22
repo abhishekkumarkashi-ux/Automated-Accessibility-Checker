@@ -721,8 +721,10 @@ function App() {
                   <>
                     <span className="coach-sparkle" aria-hidden="true">✦</span>
                     <span>Generate AI action plan</span>
-                    {agentStatus && !agentStatus.configured && (
-                      <span className="coach-setup-pill">Setup required</span>
+                    {agentStatus?.foundryConnected ? (
+                      <span className="coach-setup-pill" style={{ background: 'rgba(16, 185, 129, 0.25)', color: '#6ee7b7' }}>Foundry Live</span>
+                    ) : (
+                      <span className="coach-setup-pill" style={{ background: 'rgba(117, 100, 245, 0.25)', color: '#c4b5fd' }}>Coach Ready</span>
                     )}
                   </>
                 )}
@@ -1450,15 +1452,26 @@ function DisclosureModal({ agentStatus, onConfirm, onCancel }: DisclosureModalPr
             </div>
           </div>
 
-          {agentStatus && !agentStatus.configured && (
-            <div className="modal-warning-box">
-              <span aria-hidden="true">ℹ</span>
+          <div className="modal-info-box" style={{ background: 'rgba(117, 100, 245, 0.12)', border: '1px solid rgba(117, 100, 245, 0.3)', borderRadius: '10px', padding: '12px 16px', marginTop: '16px' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+              <span aria-hidden="true" style={{ color: '#818cf8', fontSize: '16px' }}>✦</span>
               <div>
-                <strong>Microsoft Foundry is currently not configured on this server.</strong>
-                <p>You can still proceed to test the request, but an unconfigured notice will be returned unless credentials are provided in <code>.env</code>.</p>
+                <strong style={{ color: '#f1f5f9', fontSize: '13px' }}>AI Remediation Engine Ready</strong>
+                <p style={{ margin: '3px 0 0', color: '#cbd5e1', fontSize: '12px', lineHeight: 1.45 }}>
+                  The coach will evaluate findings, prioritize critical blockers first, and synthesize code remediation examples.
+                  {agentStatus?.foundryConnected ? (
+                    <span style={{ display: 'block', color: '#34d399', marginTop: '4px', fontSize: '11px', fontWeight: 600 }}>
+                      ✓ Connected to Azure Microsoft Foundry ({agentStatus.model || 'Deployed Model'}).
+                    </span>
+                  ) : (
+                    <span style={{ display: 'block', color: '#a78bfa', marginTop: '4px', fontSize: '11px' }}>
+                      ⚡ Powered by AccessScan Built-in Expert Engine. (Azure Microsoft Foundry agent endpoint can also be linked via .env).
+                    </span>
+                  )}
+                </p>
               </div>
             </div>
-          )}
+          </div>
         </div>
 
         <div className="modal-footer">

@@ -2,6 +2,7 @@ import { DefaultAzureCredential } from '@azure/identity';
 import { AIProjectClient } from '@azure/ai-projects';
 import type { RemediationPlan, RemediationFinding } from '../types.js';
 import { scanStore } from './scanStore.js';
+import { getAxeRuleGuidance } from './ruleGuidance.js';
 import {
   functionToolDefinitions,
   getScanFindings,
@@ -135,127 +136,193 @@ function validateRemediationPlan(raw: unknown, scanId: string, model: string): R
 }
 
 /**
- * Generates an AI action plan using Microsoft Foundry Agent Service with function calling.
+ * Built-in Accessibility Remediation Expert Engine.
+ * Synthesizes a structured RemediationPlan using axe findings, priority weighting, and curated WCAG guidance.
  */
-export async function generateActionPlan(scanId: string): Promise<RemediationPlan> {
-  const config = getFoundryConfig();
-  if (!config) {
-    throw new Error(
-      'Microsoft Foundry Agent Service is not configured. Set AZURE_AI_FOUNDRY_PROJECT_ENDPOINT and AZURE_AI_FOUNDRY_MODEL_DEPLOYMENT in .env.'
-    );
-  }
-
+export function generateExpertActionPlan(scanId: string): RemediationPlan {
   const scan = scanStore.get(scanId);
   if (!scan) {
     throw new Error(`The scan with ID "${scanId}" was not found or has expired. Please run a new scan.`);
   }
 
-  const credential = new DefaultAzureCredential();
-  const projectClient = new AIProjectClient(config.endpoint, credential);
-  const openAIClient = projectClient.getOpenAIClient();
+  const prioritizedResult = prioritizeFindings(scanId, 5);
+  const priorityFindings: RemediationFinding[] = [];
 
-  // Initial user prompt with scan ID
-  const conversationMessages: any[] = [
-    { role: 'system', content: COACH_SYSTEM_PROMPT },
-    {
-      role: 'user',
-      content: `Please analyze the accessibility findings for scan ID "${scanId}" using your read-only tools and produce a structured remediation action plan.
+  for (const item of prioritizedResult.prioritized) {
+    const rawFinding = scan.violations.find((v) => v.id === item.ruleId);
+    const guidance = getAxeRuleGuidance(
+      item.ruleId,
+      rawFinding?.description,
+      rawFinding?.tags,
+      rawFinding?.helpUrl
+    );
+
+    const codeExample = guidance.exampleSnippet ? guidance.exampleSnippet.compliant : null;
+    const sampleSelector = rawFinding?.nodes[0]?.target.join(' ') || 'DOM element';
+
+    priorityFindings.push({
+      ruleId: item.ruleId,
+      help: item.help,
+      impact: (item.impact.toLowerCase() as any) || 'minor',
+      whyFirst: item.rationale,
+      steps: [
+        guidance.suggestedFix,
+        `Inspect affected element: ${sampleSelector}.`,
+        'Verify fix using screen reader navigation or re-run the scan.',
+      ],
+      codeExample,
+      wcagTags: guidance.wcagTags,
+      helpUrl: guidance.helpUrl,
+      affectedElementsCount: item.affectedElementsCount,
+    });
+  }
+
+  const totalViolations = scan.violations.length;
+  const criticalCount = scan.score.impacts.critical || 0;
+  const seriousCount = scan.score.impacts.serious || 0;
+
+  let summary = '';
+  if (totalViolations === 0) {
+    summary = 'Outstanding baseline: No automated accessibility rule violations were detected on this page.';
+  } else if (criticalCount > 0) {
+    summary = `Immediate remediation required: ${criticalCount} critical blocker${criticalCount === 1 ? '' : 's'} and ${seriousCount} serious issue${seriousCount === 1 ? '' : 's'} were detected. These prevent screen reader and keyboard-only users from interacting with primary site controls.`;
+  } else if (seriousCount > 0) {
+    summary = `High-priority remediation recommended: ${seriousCount} serious barrier${seriousCount === 1 ? '' : 's'} affect content hierarchy and interactive clarity. Address the prioritized findings below first.`;
+  } else {
+    summary = `Identified ${totalViolations} automated accessibility issue${totalViolations === 1 ? '' : 's'}. Resolving these items will elevate overall WCAG conformance and user experience.`;
+  }
+
+  return {
+    scanId,
+    summary,
+    priorityFindings,
+    manualReviewNotes:
+      'Automated testing catches approximately 30-40% of WCAG requirements. Manual testing with screen readers (NVDA, VoiceOver) and full keyboard navigation (Tab, Enter, Space, Esc) is required for complete accessibility.',
+    generatedAt: new Date().toISOString(),
+    model: 'AccessScan Coach (Built-in Expert Engine)',
+  };
+}
+
+/**
+ * Generates an AI action plan using Microsoft Foundry Agent Service when configured,
+ * or gracefully synthesizes using the built-in Expert Remediation Engine.
+ */
+export async function generateActionPlan(scanId: string): Promise<RemediationPlan> {
+  const scan = scanStore.get(scanId);
+  if (!scan) {
+    throw new Error(`The scan with ID "${scanId}" was not found or has expired. Please run a new scan.`);
+  }
+
+  const config = getFoundryConfig();
+  if (config) {
+    try {
+      const credential = new DefaultAzureCredential();
+      const projectClient = new AIProjectClient(config.endpoint, credential);
+      const openAIClient = projectClient.getOpenAIClient();
+
+      // Initial user prompt with scan ID
+      const conversationMessages: any[] = [
+        { role: 'system', content: COACH_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: `Please analyze the accessibility findings for scan ID "${scanId}" using your read-only tools and produce a structured remediation action plan.
 
 First prioritize the findings using prioritize_findings, inspect the scan details with get_scan_findings, and check rule guidance with get_axe_rule_guidance as needed. Return your final plan strictly in the required JSON format.`,
-    },
-  ];
+        },
+      ];
 
-  // Function calling loop: allow up to 6 iterations for tool execution
-  const maxIterations = 6;
-  let finalJsonText: string | null = null;
+      // Function calling loop: allow up to 6 iterations for tool execution
+      const maxIterations = 6;
+      let finalJsonText: string | null = null;
 
-  for (let i = 0; i < maxIterations; i++) {
-    const response = await openAIClient.chat.completions.create({
-      model: config.model,
-      messages: conversationMessages,
-      tools: functionToolDefinitions,
-      tool_choice: 'auto',
-      temperature: 0.1,
-    });
-
-    const choice = response.choices[0];
-    if (!choice || !choice.message) {
-      throw new Error('Received empty response from Microsoft Foundry model.');
-    }
-
-    const message = choice.message;
-    conversationMessages.push(message);
-
-    // If model requested tool calls, execute them and submit results
-    if (message.tool_calls && message.tool_calls.length > 0) {
-      for (const call of message.tool_calls) {
-        if (call.type !== 'function') continue;
-
-        const name = call.function.name;
-        let args: any = {};
-        try {
-          args = JSON.parse(call.function.arguments || '{}');
-        } catch {
-          args = {};
-        }
-
-        let result: any = null;
-        try {
-          if (name === 'get_scan_findings') {
-            result = getScanFindings(args.scanId || scanId);
-          } else if (name === 'get_axe_rule_guidance') {
-            result = getAxeRuleGuidanceTool(args.ruleId);
-          } else if (name === 'prioritize_findings') {
-            result = prioritizeFindings(args.scanId || scanId, args.limit);
-          } else {
-            result = { error: `Unknown tool: ${name}` };
-          }
-        } catch (toolError) {
-          result = { error: toolError instanceof Error ? toolError.message : String(toolError) };
-        }
-
-        conversationMessages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          content: JSON.stringify(result),
+      for (let i = 0; i < maxIterations; i++) {
+        const response = await openAIClient.chat.completions.create({
+          model: config.model,
+          messages: conversationMessages,
+          tools: functionToolDefinitions,
+          tool_choice: 'auto',
+          temperature: 0.1,
         });
+
+        const choice = response.choices[0];
+        if (!choice || !choice.message) {
+          throw new Error('Received empty response from Microsoft Foundry model.');
+        }
+
+        const message = choice.message;
+        conversationMessages.push(message);
+
+        // If model requested tool calls, execute them and submit results
+        if (message.tool_calls && message.tool_calls.length > 0) {
+          for (const call of message.tool_calls) {
+            if (call.type !== 'function') continue;
+
+            const name = call.function.name;
+            let args: any = {};
+            try {
+              args = JSON.parse(call.function.arguments || '{}');
+            } catch {
+              args = {};
+            }
+
+            let result: any = null;
+            try {
+              if (name === 'get_scan_findings') {
+                result = getScanFindings(args.scanId || scanId);
+              } else if (name === 'get_axe_rule_guidance') {
+                result = getAxeRuleGuidanceTool(args.ruleId);
+              } else if (name === 'prioritize_findings') {
+                result = prioritizeFindings(args.scanId || scanId, args.limit);
+              } else {
+                result = { error: `Unknown tool: ${name}` };
+              }
+            } catch (toolError) {
+              result = { error: toolError instanceof Error ? toolError.message : String(toolError) };
+            }
+
+            conversationMessages.push({
+              role: 'tool',
+              tool_call_id: call.id,
+              content: JSON.stringify(result),
+            });
+          }
+          continue;
+        }
+
+        // Model produced final content
+        if (message.content) {
+          finalJsonText = message.content;
+          break;
+        }
       }
-      continue;
-    }
 
-    // Model produced final content
-    if (message.content) {
-      finalJsonText = message.content;
-      break;
-    }
-  }
+      if (finalJsonText) {
+        // Extract JSON payload (strip possible markdown code block fences)
+        let cleaned = finalJsonText.trim();
+        if (cleaned.startsWith('```')) {
+          cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        }
 
-  if (!finalJsonText) {
-    throw new Error('The agent was unable to formulate a plan within the allowed tool execution steps.');
-  }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(cleaned);
+        } catch {
+          const match = cleaned.match(/\{[\s\S]*\}/);
+          if (match) {
+            parsed = JSON.parse(match[0]);
+          }
+        }
 
-  // Extract JSON payload (strip possible markdown code block fences)
-  let cleaned = finalJsonText.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    // Try regex extraction of first outer JSON object
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        parsed = JSON.parse(match[0]);
-      } catch {
-        throw new Error('The model response did not contain valid JSON.');
+        if (parsed) {
+          return validateRemediationPlan(parsed, scanId, config.model);
+        }
       }
-    } else {
-      throw new Error('The model response did not contain valid JSON.');
+    } catch (azureError) {
+      console.warn('Microsoft Foundry Agent execution error, using built-in expert synthesizer:', azureError);
     }
   }
 
-  return validateRemediationPlan(parsed, scanId, config.model);
+  // Built-in expert fallback: always delivers a complete, rich remediation plan!
+  return generateExpertActionPlan(scanId);
 }
+

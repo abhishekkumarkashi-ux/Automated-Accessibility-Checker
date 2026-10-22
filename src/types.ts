@@ -62,6 +62,7 @@ export interface ErrorState {
 
 export interface AgentStatus {
   configured: boolean;
+  foundryConnected?: boolean;
   model?: string;
 }
 
