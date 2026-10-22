@@ -13,9 +13,9 @@ import { isFoundryConfigured, getFoundryConfig, generateActionPlan } from './age
 
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
-const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS ?? 75_000);
-const scanTimeoutMs = Number(process.env.SCAN_TIMEOUT_MS ?? 65_000);
-const navigationTimeoutMs = Number(process.env.NAVIGATION_TIMEOUT_MS ?? 40_000);
+const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS ?? 32_000);
+const scanTimeoutMs = Number(process.env.SCAN_TIMEOUT_MS ?? 28_000);
+const navigationTimeoutMs = Number(process.env.NAVIGATION_TIMEOUT_MS ?? 18_000);
 const maxRedirects = 8;
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
 const demoPath = path.join(serverDirectory, 'demo.html');
@@ -180,7 +180,7 @@ async function protectBrowser(page: Page): Promise<() => ScanError | undefined> 
       return;
     }
 
-    // Abort media and heavy streaming/tracking to save bandwidth, CPU, and prevent hangs on YouTube/NASA
+    // Abort media and heavy streaming/tracking to save bandwidth, CPU, and prevent hangs on YouTube/NASA/college portals
     if (
       resourceType === 'media' ||
       rawUrl.includes('videoplayback') ||
@@ -188,9 +188,17 @@ async function protectBrowser(page: Page): Promise<() => ScanError | undefined> 
       rawUrl.includes('doubleclick.net') ||
       rawUrl.includes('googleads') ||
       rawUrl.includes('google-analytics.com') ||
+      rawUrl.includes('googletagmanager.com') ||
       rawUrl.includes('analytics.') ||
       rawUrl.includes('hotjar.com') ||
-      rawUrl.includes('facebook.net')
+      rawUrl.includes('clarity.ms') ||
+      rawUrl.includes('facebook.net') ||
+      rawUrl.includes('nopaperforms') ||
+      rawUrl.includes('npfs.co') ||
+      rawUrl.includes('criteo.') ||
+      rawUrl.includes('leadsq') ||
+      rawUrl.includes('tawk.to') ||
+      rawUrl.includes('intercom.io')
     ) {
       await route.abort('blockedbyclient').catch(() => undefined);
       return;
@@ -377,7 +385,7 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
 
     const page = await context.newPage();
     page.setDefaultNavigationTimeout(navigationTimeoutMs);
-    page.setDefaultTimeout(45_000);
+    page.setDefaultTimeout(25_000);
 
     // Mask webdriver and bypass Trusted Types restrictions safely
     await page.addInitScript(() => {
@@ -515,7 +523,7 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
   } catch (error) {
     if (timedOut) {
       throw new ScanError(
-        'The scan exceeded the maximum time limit (65s). Try a simpler or faster page.',
+        `The scan exceeded the time limit (${Math.round(scanTimeoutMs / 1000)}s). Try a simpler or faster page.`,
         504,
         'TIMEOUT'
       );

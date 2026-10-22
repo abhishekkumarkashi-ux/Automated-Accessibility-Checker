@@ -12,8 +12,8 @@ services:
       - key: HOST
         value: 0.0.0.0
       - key: SCAN_TIMEOUT_MS
-        value: "60000"
+        value: "28000"
       - key: REQUEST_TIMEOUT_MS
-        value: "70000"
+        value: "32000"
       - key: NAVIGATION_TIMEOUT_MS
-        value: "40000"
+        value: "18000"

@@ -158,9 +158,10 @@ function App() {
         data = JSON.parse(responseText);
       } catch {
         // Non-JSON response (e.g. gateway timeout or proxy error)
+        const isGateway = response.status === 502 || response.status === 504;
         throw new Error(
-          response.status === 504
-            ? 'Gateway timeout: The website or proxy took too long to respond.'
+          isGateway
+            ? `The scan timed out on the cloud gateway (HTTP ${response.status}). The website took too long to finish loading.`
             : `The server returned an unexpected response (HTTP ${response.status}).`
         );
       }
@@ -200,11 +201,15 @@ function App() {
           failedUrl: targetUrl,
         });
       } else {
+        const message = caught instanceof Error ? caught.message : 'An unexpected error occurred during the scan.';
+        const isTimeout = message.includes('502') || message.includes('504') || /timeout|gateway/i.test(message);
         setError({
-          title: 'Scan failed to complete',
-          message: caught instanceof Error ? caught.message : 'An unexpected error occurred during the scan.',
-          code: 'CLIENT_ERROR',
-          suggestion: 'Please verify the address or try the demo scan.',
+          title: isTimeout ? 'Scan Timed Out (Slow Page)' : 'Scan failed to complete',
+          message,
+          code: isTimeout ? 'TIMEOUT' : 'CLIENT_ERROR',
+          suggestion: isTimeout
+            ? 'The target website took longer than expected to load on the cloud server. Try scanning a specific subpage or try the demo scan.'
+            : 'Please verify the address or try the demo scan.',
           failedUrl: targetUrl,
         });
       }
