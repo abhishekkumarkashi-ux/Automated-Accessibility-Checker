@@ -4,15 +4,21 @@ import type {
   AgentStatus,
   AuditScore,
   Category,
+  CrawlReport,
   ErrorState,
   Filter,
   Finding,
   RemediationPlan,
-  ScanErrorInfo,
+  ScanHistoryEntry,
   ScanReport,
 } from './types';
 import { calculateScore, getScoreColor } from './utils/score';
 import { generateAccessibilityPdfReport } from './utils/pdfReport';
+import { ManualAuditModal } from './components/ManualAuditModal';
+import { ScoreBreakdownModal } from './components/ScoreBreakdownModal';
+import { ScanHistoryModal } from './components/ScanHistoryModal';
+import { getRemediationGuide } from './utils/remediationGuide';
+import { saveScanToHistory } from './utils/scanHistory';
 
 const filters: Array<{ id: Filter; label: string }> = [
   { id: 'all', label: 'All results' },
@@ -50,15 +56,6 @@ const explanations: Record<string, string> = {
   'document-title': 'A useful page title helps people identify the page in browser tabs and when navigating with assistive technology.',
 };
 
-const fixes: Record<string, string> = {
-  'image-alt': 'For an informative image, add a concise alt attribute that conveys its purpose. For a purely decorative image, use alt="".',
-  label: 'Add a visible <label for="field-id"> that points to the control’s id, or provide an equivalent accessible name when a visible label is not appropriate.',
-  'button-name': 'Put descriptive text inside the button, or add aria-label with a concise action name when the button is icon-only.',
-  'link-name': 'Use descriptive text inside the link, or add an accessible name if the link contains only an icon.',
-  'color-contrast': 'Adjust the foreground or background color, then check the actual text size and contrast ratio against your design requirements.',
-  'document-title': 'Add a concise, page-specific <title> element inside the document head.',
-};
-
 const categoryMeta: Record<Category, { label: string; icon: string }> = {
   violations: { label: 'Violation', icon: '!' },
   incomplete: { label: 'Needs review', icon: '?' },
@@ -91,6 +88,19 @@ function App() {
   const [aiError, setAiError] = useState<string | null>(null);
   const [showDisclosureModal, setShowDisclosureModal] = useState(false);
   const [disclosureAcknowledged, setDisclosureAcknowledged] = useState(false);
+  
+  // Advanced features state
+  const [scanMode, setScanMode] = useState<'single' | 'crawl'>('single');
+  const [crawlMaxPages] = useState<number>(3);
+  const [viewport, setViewport] = useState<'desktop' | 'mobile'>('desktop');
+  const [autoScroll, setAutoScroll] = useState<boolean>(false);
+  const [crawlReport, setCrawlReport] = useState<CrawlReport | null>(null);
+  const [activeCrawlTab, setActiveCrawlTab] = useState<number>(-1);
+  const [isManualAuditOpen, setIsManualAuditOpen] = useState(false);
+  const [isScoreModalOpen, setIsScoreModalOpen] = useState(false);
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
+  const [currentScanHistory, setCurrentScanHistory] = useState<ScanHistoryEntry | undefined>(undefined);
+  
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Check agent configuration status on mount
@@ -121,6 +131,7 @@ function App() {
 
     setError(null);
     setReport(null);
+    setCrawlReport(null);
     setAiPlan(null);
     setAiError(null);
     setAiLoading(false);
@@ -146,14 +157,25 @@ function App() {
     setLoading(true);
 
     try {
-      const response = await fetch(kind === 'demo' ? '/api/demo' : '/api/scan', {
+      const endpoint = kind === 'demo' ? '/api/demo' : scanMode === 'crawl' ? '/api/crawl' : '/api/scan';
+      const body =
+        kind === 'demo'
+          ? '{}'
+          : JSON.stringify({
+              url: targetUrl,
+              viewport,
+              autoScroll,
+              maxPages: crawlMaxPages,
+            });
+
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: kind === 'demo' ? '{}' : JSON.stringify({ url: targetUrl }),
+        body,
       });
 
       const responseText = await response.text();
-      let data: (ScanReport & ScanErrorInfo) | null = null;
+      let data: any = null;
       try {
         data = JSON.parse(responseText);
       } catch {
@@ -166,7 +188,7 @@ function App() {
         );
       }
 
-      if (!response.ok || !data || !('counts' in data)) {
+      if (!response.ok || !data) {
         const errorMsg = data?.error || 'The scan could not be completed.';
         const code = data?.code || (response.status === 403 ? 'ACCESS_DENIED' : response.status === 404 ? 'NOT_FOUND' : 'SCAN_FAILED');
         const suggestion = data?.suggestion;
@@ -190,7 +212,57 @@ function App() {
         return;
       }
 
-      setReport(data);
+      if (scanMode === 'crawl' && kind === 'website' && data.pages) {
+        const crawlData = data as CrawlReport;
+        setCrawlReport(crawlData);
+        setActiveCrawlTab(-1);
+
+        const representativeReport: ScanReport = {
+          scanId: crawlData.scanId,
+          scannedUrl: crawlData.startingUrl,
+          scannedAt: crawlData.scannedAt,
+          counts: {
+            violations: crawlData.overallScore.totalViolations,
+            passes: crawlData.overallScore.totalPasses,
+            incomplete: crawlData.pages.reduce((acc, p) => acc + p.counts.incomplete, 0),
+          },
+          violations: crawlData.pages.flatMap((p) => p.violations),
+          passes: crawlData.pages.flatMap((p) => p.passes),
+          incomplete: crawlData.pages.flatMap((p) => p.incomplete),
+          source: 'website',
+          score: crawlData.overallScore,
+        };
+        setReport(representativeReport);
+
+        const historyItem = saveScanToHistory({
+          url: targetUrl,
+          scannedAt: crawlData.scannedAt,
+          score: crawlData.overallScore.score,
+          grade: crawlData.overallScore.grade,
+          violationsCount: crawlData.overallScore.totalViolations,
+          passesCount: crawlData.overallScore.totalPasses,
+          violationIds: crawlData.siteWideUniqueViolations.map((v) => v.id),
+          viewport,
+          source: 'crawl',
+        });
+        setCurrentScanHistory(historyItem);
+      } else {
+        setCrawlReport(null);
+        setReport(data);
+
+        const historyItem = saveScanToHistory({
+          url: targetUrl || 'Local demo.html',
+          scannedAt: data.scannedAt || new Date().toISOString(),
+          score: data.score?.score ?? 100,
+          grade: data.score?.grade ?? 'A',
+          violationsCount: data.violations?.length ?? 0,
+          passesCount: data.passes?.length ?? 0,
+          violationIds: (data.violations || []).map((v: Finding) => v.id),
+          viewport,
+          source: kind === 'demo' ? 'demo' : 'website',
+        });
+        setCurrentScanHistory(historyItem);
+      }
     } catch (caught: unknown) {
       if (caught instanceof TypeError && caught.message.toLowerCase().includes('fetch')) {
         setError({
@@ -365,7 +437,33 @@ function App() {
           <span className="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12.5 4.3 4.2L19.5 6.8" /></svg></span>
           <span>access<span className="brand-light">scan</span></span>
         </a>
-        <div className="local-badge"><span aria-hidden="true" className="status-dot" /> LOCAL PROTOTYPE</div>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="util-nav-btn"
+            onClick={() => setIsManualAuditOpen(true)}
+            title="Open guided manual accessibility checklist"
+          >
+            📋 Manual Audit
+          </button>
+          <button
+            type="button"
+            className="util-nav-btn"
+            onClick={() => setIsHistoryModalOpen(true)}
+            title="Open audit history and before-and-after comparisons"
+          >
+            🕒 History & Regression
+          </button>
+          <button
+            type="button"
+            className="util-nav-btn"
+            onClick={() => setIsScoreModalOpen(true)}
+            title="View scoring methodology and formula"
+          >
+            ℹ️ Scoring Formula
+          </button>
+          <div className="local-badge"><span aria-hidden="true" className="status-dot" /> LIVE ENGINE</div>
+        </div>
       </header>
 
       <main id="top" className="main-content">
@@ -379,7 +477,7 @@ function App() {
           <div className="scan-card-heading">
             <div className="scan-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.6" /><path d="m16 16 4.1 4.1M8 11h5.6M10.8 8.2v5.6" /></svg></div>
             <div>
-              <h2 id="scan-title">Check a webpage</h2>
+              <h2 id="scan-title">Check a webpage or website</h2>
               <p>Type any domain (e.g. youtube.com, nasa.gov) or full URL.</p>
             </div>
           </div>
@@ -411,8 +509,65 @@ function App() {
                 />
               </div>
               <button className="primary-button" type="submit" disabled={loading || !url.trim()}>
-                {loading ? <><span className="spinner" aria-hidden="true" /> Scanning…</> : <>Scan website <span aria-hidden="true">→</span></>}
+                {loading ? <><span className="spinner" aria-hidden="true" /> Scanning…</> : <>{scanMode === 'crawl' ? 'Crawl website' : 'Scan website'} <span aria-hidden="true">→</span></>}
               </button>
+            </div>
+
+            {/* Scan Configuration Options: Scope, Viewport, Auto-Scroll */}
+            <div className="scan-options-row">
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '11px', color: 'var(--muted)', fontWeight: 600 }}>SCOPE:</span>
+                <div className="scan-mode-toggles">
+                  <button
+                    type="button"
+                    className={`mode-toggle-btn ${scanMode === 'single' ? 'active' : ''}`}
+                    onClick={() => setScanMode('single')}
+                    disabled={loading}
+                  >
+                    📄 Single Page
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-toggle-btn ${scanMode === 'crawl' ? 'active' : ''}`}
+                    onClick={() => setScanMode('crawl')}
+                    disabled={loading}
+                    title="Crawl internal links to audit multiple subpages across the site"
+                  >
+                    🕸️ Multi-Page Crawl (3 pages)
+                  </button>
+                </div>
+
+                <span style={{ fontSize: '11px', color: 'var(--muted)', fontWeight: 600, marginLeft: '6px' }}>VIEWPORT:</span>
+                <div className="scan-mode-toggles">
+                  <button
+                    type="button"
+                    className={`mode-toggle-btn ${viewport === 'desktop' ? 'active' : ''}`}
+                    onClick={() => setViewport('desktop')}
+                    disabled={loading}
+                  >
+                    💻 Desktop
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-toggle-btn ${viewport === 'mobile' ? 'active' : ''}`}
+                    onClick={() => setViewport('mobile')}
+                    disabled={loading}
+                    title="Audit responsive mobile viewport (375x667)"
+                  >
+                    📱 Mobile
+                  </button>
+                </div>
+              </div>
+
+              <label className="autoscroll-toggle">
+                <input
+                  type="checkbox"
+                  checked={autoScroll}
+                  onChange={(e) => setAutoScroll(e.target.checked)}
+                  disabled={loading}
+                />
+                <span>Trigger dynamic scroll content</span>
+              </label>
             </div>
           </form>
 
@@ -608,8 +763,132 @@ function App() {
           <p className="sr-only" role="status" aria-live="polite">
             Scan complete. Audit score: {score ? score.score : 0} of 100, Grade {score ? score.grade : ''}. {report.counts.violations} violations, {report.counts.incomplete} checks for manual review, and {report.counts.passes} passed checks.
           </p>
-          <div className="report-meta"><span className="meta-label">PAGE</span><span className="scanned-url" title={report.scannedUrl}>{report.scannedUrl}</span><span className="meta-separator">·</span><span>Scanned {formatDate(report.scannedAt)}</span><span className="scope-chip">ONE PAGE</span></div>
-          {score && <AuditScoreCard score={score} />}
+          <div className="report-meta">
+            <span className="meta-label">{crawlReport ? 'CRAWL' : 'PAGE'}</span>
+            <span className="scanned-url" title={report.scannedUrl}>{report.scannedUrl}</span>
+            <span className="meta-separator">·</span>
+            <span>Scanned {formatDate(report.scannedAt)}</span>
+            <span className="scope-chip">{crawlReport ? `${crawlReport.pages.length} PAGES` : 'ONE PAGE'}</span>
+            <span className="scope-chip" style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8' }}>
+              {viewport.toUpperCase()}
+            </span>
+          </div>
+
+          {/* Multi-Page Crawl Results Panel */}
+          {crawlReport && (
+            <div className="crawl-overview-card" aria-label="Multi-Page Crawl Overview">
+              <div className="crawl-card-header">
+                <div className="crawl-badge">
+                  <span aria-hidden="true">🕸️</span> Multi-Page Crawl Results ({crawlReport.pages.length} Pages Audited)
+                </div>
+                <span style={{ fontSize: '11px', color: 'var(--muted)' }}>
+                  Domain: <strong>{new URL(crawlReport.startingUrl).hostname}</strong>
+                </span>
+              </div>
+
+              <div className="crawl-tabs-nav" role="tablist" aria-label="Pages in crawl">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeCrawlTab === -1}
+                  className={`crawl-tab-item ${activeCrawlTab === -1 ? 'active' : ''}`}
+                  onClick={() => {
+                    setActiveCrawlTab(-1);
+                    setReport({
+                      scanId: crawlReport.scanId,
+                      scannedUrl: crawlReport.startingUrl,
+                      scannedAt: crawlReport.scannedAt,
+                      counts: {
+                        violations: crawlReport.overallScore.totalViolations,
+                        passes: crawlReport.overallScore.totalPasses,
+                        incomplete: crawlReport.pages.reduce((acc, p) => acc + p.counts.incomplete, 0),
+                      },
+                      violations: crawlReport.pages.flatMap((p) => p.violations),
+                      passes: crawlReport.pages.flatMap((p) => p.passes),
+                      incomplete: crawlReport.pages.flatMap((p) => p.incomplete),
+                      source: 'website',
+                      score: crawlReport.overallScore,
+                    });
+                  }}
+                >
+                  <span>🌐 Site Overview</span>
+                  <span
+                    className="crawl-score-badge"
+                    style={{ background: getScoreColor(crawlReport.overallScore.score), color: '#000' }}
+                  >
+                    {crawlReport.overallScore.score}
+                  </span>
+                </button>
+
+                {crawlReport.pages.map((p, idx) => {
+                  let path = p.url;
+                  try {
+                    path = new URL(p.url).pathname || '/';
+                  } catch {}
+                  return (
+                    <button
+                      key={p.url}
+                      type="button"
+                      role="tab"
+                      aria-selected={activeCrawlTab === idx}
+                      className={`crawl-tab-item ${activeCrawlTab === idx ? 'active' : ''}`}
+                      onClick={() => {
+                        setActiveCrawlTab(idx);
+                        setReport({
+                          scanId: `${crawlReport.scanId}-page-${idx}`,
+                          scannedUrl: p.url,
+                          scannedAt: crawlReport.scannedAt,
+                          counts: p.counts,
+                          violations: p.violations,
+                          passes: p.passes,
+                          incomplete: p.incomplete,
+                          source: 'website',
+                          score: p.score,
+                        });
+                      }}
+                    >
+                      <span>{path.length > 20 ? path.slice(0, 18) + '…' : path}</span>
+                      <span
+                        className="crawl-score-badge"
+                        style={{ background: getScoreColor(p.score.score), color: '#000' }}
+                      >
+                        {p.score.score}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="crawl-stats-grid">
+                <div className="crawl-stat-box">
+                  <span className="crawl-stat-label">Unique Violations</span>
+                  <span className="crawl-stat-val" style={{ color: '#f87171' }}>
+                    {crawlReport.siteWideUniqueViolations.length}
+                  </span>
+                </div>
+                <div className="crawl-stat-box">
+                  <span className="crawl-stat-label">Critical Issues</span>
+                  <span className="crawl-stat-val" style={{ color: '#f87171' }}>
+                    {crawlReport.overallScore.impacts.critical}
+                  </span>
+                </div>
+                <div className="crawl-stat-box">
+                  <span className="crawl-stat-label">Serious Issues</span>
+                  <span className="crawl-stat-val" style={{ color: '#fb923c' }}>
+                    {crawlReport.overallScore.impacts.serious}
+                  </span>
+                </div>
+                <div className="crawl-stat-box">
+                  <span className="crawl-stat-label">Pages Checked</span>
+                  <span className="crawl-stat-val" style={{ color: '#38bdf8' }}>
+                    {crawlReport.pages.length}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {score && <AuditScoreCard score={score} onOpenFormula={() => setIsScoreModalOpen(true)} />}
 
           {/* AI Accessibility Coach Action Plan Section (clearly separated from axe findings) */}
           {(aiPlan || aiLoading || aiError) && (
@@ -658,11 +937,41 @@ function App() {
           onCancel={() => setShowDisclosureModal(false)}
         />
       )}
+
+      {/* Guided Manual WCAG Audit Checklist Modal */}
+      <ManualAuditModal
+        isOpen={isManualAuditOpen}
+        onClose={() => setIsManualAuditOpen(false)}
+      />
+
+      {/* Score Transparency & Methodology Breakdown Modal */}
+      <ScoreBreakdownModal
+        isOpen={isScoreModalOpen}
+        onClose={() => setIsScoreModalOpen(false)}
+      />
+
+      {/* Historical Scans & Regression Tracking Modal */}
+      <ScanHistoryModal
+        isOpen={isHistoryModalOpen}
+        onClose={() => setIsHistoryModalOpen(false)}
+        currentScan={currentScanHistory}
+        onSelectScanUrl={(selectedUrl: string) => {
+          setIsHistoryModalOpen(false);
+          setUrl(selectedUrl);
+          void runScan('website', selectedUrl);
+        }}
+      />
     </div>
   );
 }
 
-function AuditScoreCard({ score }: { score: AuditScore }) {
+function AuditScoreCard({
+  score,
+  onOpenFormula,
+}: {
+  score: AuditScore;
+  onOpenFormula?: () => void;
+}) {
   const color = getScoreColor(score.score);
   const radius = 38;
   const circumference = 2 * Math.PI * radius;
@@ -705,6 +1014,22 @@ function AuditScoreCard({ score }: { score: AuditScore }) {
             </span>
             <span className="score-rating-text">{score.rating}</span>
             <span className="score-pass-chip">{score.complianceRate}% Rule Pass Rate</span>
+            <span
+              className="estimate-disclaimer-pill"
+              title="Automated testing cannot prove full WCAG conformance. Manual testing is still required."
+            >
+              ⚠ Automated Estimate
+            </span>
+            {onOpenFormula && (
+              <button
+                type="button"
+                className="score-formula-trigger-btn"
+                onClick={onOpenFormula}
+                title="View how this score is weighted and why automated tools have limits"
+              >
+                ℹ️ Formula & Scope
+              </button>
+            )}
           </div>
 
           <h3 className="audit-score-heading">Automated Accessibility Score</h3>
@@ -748,6 +1073,8 @@ function SummaryCard({ category, count, title, subtitle }: { category: Category;
 function FindingCard({ category, finding, onCopy }: { category: Category; finding: Finding; onCopy: (value: string, label: string) => Promise<void> }) {
   const meta = categoryMeta[category];
   const impact = finding.impact ? `${finding.impact[0].toUpperCase()}${finding.impact.slice(1)} impact` : 'Impact not set';
+  const guide = getRemediationGuide(finding.id, finding.help, finding.helpUrl);
+
   return <article className={`finding-card finding-${category}`}>
     <details>
       <summary className="finding-summary">
@@ -759,8 +1086,59 @@ function FindingCard({ category, finding, onCopy }: { category: Category; findin
       <div className="finding-details">
         <div className="detail-section"><h3>What this means</h3><p>{finding.description}</p></div>
         {explanations[finding.id] && <div className="detail-section plain-language"><h3>In plain language</h3><p>{explanations[finding.id]}</p></div>}
-        {category === 'violations' && fixes[finding.id] && <div className="detail-section fix-guidance"><h3><span aria-hidden="true">✦</span> Suggested fix</h3><p>{fixes[finding.id]}</p><span className="guidance-note">Curated guidance · verify it fits your page</span></div>}
-        <div className="detail-section"><h3>Affected elements <span className="section-count">{finding.nodes.length}</span></h3>
+
+        {/* Rich Remediation Box with WCAG Criterion, code comparison, and verification steps */}
+        {category === 'violations' && (
+          <div className="rich-remediation-box">
+            <div className="remediation-header">
+              <span className="wcag-criterion-badge">
+                {guide.wcagCriterion}
+              </span>
+              <span className="wcag-level-pill">Level {guide.wcagLevel}</span>
+            </div>
+            <p style={{ margin: '4px 0 10px', fontSize: '11px', color: '#cbd5e1' }}>
+              <strong>Fix Explanation:</strong> {guide.impactExplanation}
+            </p>
+
+            <div className="code-compare-grid">
+              <div className="code-block-box before">
+                <div className="code-block-header">
+                  <span>❌ Problematic Markup</span>
+                </div>
+                <pre className="code-content"><code>{guide.beforeCode}</code></pre>
+              </div>
+              <div className="code-block-box after">
+                <div className="code-block-header">
+                  <span>✅ Recommended WCAG Fix</span>
+                  <button
+                    type="button"
+                    className="copy-button"
+                    onClick={() => void onCopy(guide.afterCode, 'Remediation code example')}
+                  >
+                    Copy fix
+                  </button>
+                </div>
+                <pre className="code-content"><code>{guide.afterCode}</code></pre>
+              </div>
+            </div>
+
+            <div className="verification-list">
+              <strong>How to verify this fix:</strong>
+              <ul>
+                {guide.verificationSteps.map((step, idx) => (
+                  <li key={idx}>{step}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
+        <div className="detail-section">
+          <h3>Affected elements <span className="section-count">{finding.nodes.length}</span></h3>
+          <div className="privacy-redaction-banner">
+            <span className="privacy-shield-icon" aria-hidden="true">🔒</span>
+            <span>Sensitive input values, passwords, auth tokens, and emails are automatically redacted.</span>
+          </div>
           {finding.nodes.map((node, index) => {
             const selector = node.target.join(', ') || 'Selector unavailable';
             return <div className="node-card" key={`${selector}-${index}`}>

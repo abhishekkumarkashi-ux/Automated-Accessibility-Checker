@@ -86,3 +86,69 @@ export interface RemediationPlan {
   model: string;
 }
 
+export interface PageScanResult {
+  url: string;
+  pageTitle: string;
+  scannedAt: string;
+  counts: Record<Category, number>;
+  score: AuditScore;
+  violations: Finding[];
+  passes: Finding[];
+  incomplete: Finding[];
+}
+
+export interface CrawlReport {
+  scanId?: string;
+  startingUrl: string;
+  scannedAt: string;
+  source: 'crawl';
+  viewport: 'desktop' | 'mobile';
+  totalPagesScanned: number;
+  overallScore: AuditScore & { totalViolations: number; totalPasses: number };
+  pages: PageScanResult[];
+  siteWideUniqueViolations: Array<{
+    id: string;
+    impact?: string;
+    description: string;
+    help: string;
+    helpUrl: string;
+    tags?: string[];
+    affectedPagesCount: number;
+    pages: string[];
+    totalOccurrences: number;
+  }>;
+}
+
+export interface ManualAuditItem {
+  id: string;
+  title: string;
+  wcagCriterion: string;
+  description: string;
+  testSteps: string[];
+  status: 'untested' | 'pass' | 'fail' | 'na';
+  notes: string;
+}
+
+export interface ScanHistoryEntry {
+  id: string;
+  url: string;
+  scannedAt: string;
+  score: number;
+  grade: 'A+' | 'A' | 'B' | 'C' | 'D' | 'F';
+  violationsCount: number;
+  passesCount: number;
+  violationIds: string[];
+  viewport: 'desktop' | 'mobile';
+  source: 'website' | 'crawl' | 'demo';
+}
+
+export interface RegressionComparison {
+  previousScan: ScanHistoryEntry;
+  currentScore: number;
+  scoreDelta: number;
+  resolvedViolations: string[];
+  newRegressions: string[];
+  persistentViolations: string[];
+}
+
+

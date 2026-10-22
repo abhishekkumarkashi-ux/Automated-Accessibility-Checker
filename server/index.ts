@@ -10,6 +10,15 @@ import type { AxeResults, Result } from 'axe-core';
 import { ScanError, validatePublicDestination, validateUrlSyntax } from './safety.js';
 import { scanStore } from './agent/scanStore.js';
 import { isFoundryConfigured, getFoundryConfig, generateActionPlan } from './agent/foundryAgent.js';
+import { scanLimiter } from './limiter.js';
+import { sanitizeHtmlSnippet, sanitizeTargetSelectors } from './sanitizer.js';
+import {
+  extractInternalLinks,
+  aggregateCrawlScore,
+  aggregateUniqueViolations,
+  type PageScanResult,
+  type CrawlResponse,
+} from './crawler.js';
 
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
@@ -44,6 +53,11 @@ interface AuditScore {
   };
 }
 
+export interface ScanOptions {
+  viewport?: 'desktop' | 'mobile' | 'tablet';
+  autoScroll?: boolean;
+}
+
 interface ScanResponse {
   scanId?: string;
   scannedUrl: string;
@@ -54,6 +68,7 @@ interface ScanResponse {
   incomplete: ScanResultItem[];
   source: 'website' | 'demo';
   score: AuditScore;
+  viewport?: 'desktop' | 'mobile' | 'tablet';
 }
 
 function calculateScore(violations: Result[], passesCount: number): AuditScore {
@@ -129,8 +144,8 @@ function resultItems(items: Result[]): ScanResultItem[] {
       all,
       none,
       failureSummary,
-      html: html.length > 500 ? html.slice(0, 497) + '...' : html,
-      target,
+      html: sanitizeHtmlSnippet(html.length > 500 ? html.slice(0, 497) + '...' : html),
+      target: sanitizeTargetSelectors(target) as Result['nodes'][number]['target'],
       impact: nodeImpact,
     }));
 
@@ -146,7 +161,12 @@ function resultItems(items: Result[]): ScanResultItem[] {
   });
 }
 
-function toResponse(results: AxeResults, scannedUrl: string, source: ScanResponse['source']): ScanResponse {
+function toResponse(
+  results: AxeResults,
+  scannedUrl: string,
+  source: ScanResponse['source'],
+  viewport: ScanResponse['viewport'] = 'desktop'
+): ScanResponse {
   // Score is calculated from full axe results before node trimming to preserve full accuracy
   const score = calculateScore(results.violations, results.passes.length);
   const violations = resultItems(results.violations);
@@ -162,6 +182,7 @@ function toResponse(results: AxeResults, scannedUrl: string, source: ScanRespons
     incomplete,
     source,
     score,
+    viewport,
   };
 }
 
@@ -324,7 +345,7 @@ async function runAxe(page: Page): Promise<AxeResults> {
   }
 }
 
-async function scanWebsite(url: URL): Promise<ScanResponse> {
+async function scanWebsite(url: URL, options?: ScanOptions): Promise<ScanResponse> {
   let browser: Browser | undefined;
   let timedOut = false;
   const watchdog = setTimeout(() => {
@@ -351,21 +372,30 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
       ],
     });
 
+    const isMobile = options?.viewport === 'mobile';
+    const isTablet = options?.viewport === 'tablet';
+    const viewportConfig = isMobile
+      ? { width: 375, height: 667 }
+      : isTablet
+        ? { width: 768, height: 1024 }
+        : { width: 1280, height: 800 };
+
+    const userAgent = isMobile
+      ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1 AccessScan/1.0'
+      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
     const context = await browser.newContext({
       serviceWorkers: 'block',
       ignoreHTTPSErrors: true,
       bypassCSP: true,
       javaScriptEnabled: true,
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      isMobile,
+      userAgent,
       locale: 'en-US',
-      viewport: { width: 1280, height: 800 },
+      viewport: viewportConfig,
       extraHTTPHeaders: {
         'Accept-Language': 'en-US,en;q=0.9',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Upgrade-Insecure-Requests': '1',
       },
     });
@@ -427,6 +457,15 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
       });
       // Brief pause for initial DOM hydration on modern SPAs
       await page.waitForTimeout(1000);
+
+      // Perform controlled auto-scroll to trigger lazy-loaded elements and responsive components
+      if (options?.autoScroll) {
+        await page.evaluate(async () => {
+          window.scrollBy({ top: 800, behavior: 'instant' });
+          await new Promise((r) => setTimeout(r, 200));
+          window.scrollTo({ top: 0, behavior: 'instant' });
+        }).catch(() => undefined);
+      }
     } catch (error) {
       const blockedNavigation = getBlockedNavigation();
       if (blockedNavigation) throw blockedNavigation;
@@ -522,7 +561,7 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
     }
 
     const results = await runAxe(page);
-    return toResponse(results, page.url(), 'website');
+    return toResponse(results, page.url(), 'website', options?.viewport || 'desktop');
   } catch (error) {
     if (timedOut) {
       throw new ScanError(
@@ -530,6 +569,158 @@ async function scanWebsite(url: URL): Promise<ScanResponse> {
         504,
         'TIMEOUT'
       );
+    }
+    throw error;
+  } finally {
+    clearTimeout(watchdog);
+    if (browser) await browser.close().catch(() => undefined);
+  }
+}
+
+async function crawlWebsite(
+  startUrl: URL,
+  maxPagesRequested = 3,
+  options?: ScanOptions
+): Promise<CrawlResponse> {
+  const maxPages = Math.min(Math.max(Number(maxPagesRequested) || 3, 1), 5);
+  let browser: Browser | undefined;
+  let timedOut = false;
+  const crawlTimeoutMs = Math.min(scanTimeoutMs * maxPages, 55_000);
+  const watchdog = setTimeout(() => {
+    timedOut = true;
+    void browser?.close().catch(() => undefined);
+  }, crawlTimeoutMs);
+
+  try {
+    await validatePublicDestination(startUrl);
+
+    browser = await chromium.launch({
+      headless: true,
+      timeout: 20_000,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--mute-audio',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-extensions',
+      ],
+    });
+
+    const isMobile = options?.viewport === 'mobile';
+    const isTablet = options?.viewport === 'tablet';
+    const viewportConfig = isMobile
+      ? { width: 375, height: 667 }
+      : isTablet
+        ? { width: 768, height: 1024 }
+        : { width: 1280, height: 800 };
+
+    const userAgent = isMobile
+      ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1 AccessScan/1.0'
+      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+    const context = await browser.newContext({
+      serviceWorkers: 'block',
+      ignoreHTTPSErrors: true,
+      bypassCSP: true,
+      javaScriptEnabled: true,
+      isMobile,
+      userAgent,
+      locale: 'en-US',
+      viewport: viewportConfig,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+      },
+    });
+
+    const page = await context.newPage();
+    page.setDefaultNavigationTimeout(15_000);
+    page.setDefaultTimeout(20_000);
+    await protectBrowser(page);
+
+    const pageResults: PageScanResult[] = [];
+    const urlsToScan = [startUrl.toString()];
+    const visited = new Set<string>();
+
+    for (let i = 0; i < urlsToScan.length && pageResults.length < maxPages; i++) {
+      const currentUrlString = urlsToScan[i];
+      if (visited.has(currentUrlString)) continue;
+      visited.add(currentUrlString);
+
+      try {
+        const currentUrl = new URL(currentUrlString);
+        await validatePublicDestination(currentUrl);
+
+        await page.goto(currentUrlString, { waitUntil: 'domcontentloaded', timeout: 14_000 }).catch(() => undefined);
+        const hasContent = await page.evaluate(() => Boolean(document.body && document.body.children.length > 0)).catch(() => false);
+        if (!hasContent) continue;
+
+        if (options?.autoScroll) {
+          await page.evaluate(async () => {
+            window.scrollBy({ top: 600, behavior: 'instant' });
+            await new Promise((r) => setTimeout(r, 150));
+            window.scrollTo({ top: 0, behavior: 'instant' });
+          }).catch(() => undefined);
+        }
+
+        const pageTitle = (await page.title().catch(() => '')) || currentUrl.pathname || currentUrl.hostname;
+
+        // If on the first page, extract internal links for subsequent pages
+        if (i === 0 && maxPages > 1) {
+          const links = await extractInternalLinks(page, startUrl);
+          for (const link of links) {
+            if (!visited.has(link) && !urlsToScan.includes(link) && urlsToScan.length < maxPages + 5) {
+              urlsToScan.push(link);
+            }
+          }
+        }
+
+        const axeRes = await runAxe(page);
+        const score = calculateScore(axeRes.violations, axeRes.passes.length);
+        const violations = resultItems(axeRes.violations);
+        const passes = resultItems(axeRes.passes);
+        const incomplete = resultItems(axeRes.incomplete);
+
+        pageResults.push({
+          url: currentUrlString,
+          pageTitle,
+          scannedAt: new Date().toISOString(),
+          counts: { violations: violations.length, passes: passes.length, incomplete: incomplete.length },
+          score,
+          violations,
+          passes,
+          incomplete,
+        });
+      } catch (err) {
+        console.warn(`Could not crawl page ${currentUrlString}:`, err);
+      }
+    }
+
+    if (pageResults.length === 0) {
+      throw new ScanError('Failed to scan any pages on the requested website.', 502, 'SCAN_FAILED');
+    }
+
+    const overallScore = aggregateCrawlScore(pageResults);
+    const siteWideUniqueViolations = aggregateUniqueViolations(pageResults);
+
+    return {
+      startingUrl: startUrl.toString(),
+      scannedAt: new Date().toISOString(),
+      source: 'crawl',
+      viewport: options?.viewport === 'mobile' ? 'mobile' : 'desktop',
+      totalPagesScanned: pageResults.length,
+      overallScore,
+      pages: pageResults,
+      siteWideUniqueViolations,
+    };
+  } catch (error) {
+    if (timedOut) {
+      throw new ScanError('The multi-page crawl exceeded the time limit. Try fewer pages.', 504, 'TIMEOUT');
     }
     throw error;
   } finally {
@@ -576,7 +767,9 @@ async function scanDemo(): Promise<ScanResponse> {
   }
 }
 
-app.get('/api/health', (_request, response) => response.json({ ok: true }));
+app.get('/api/health', (_request, response) =>
+  response.json({ ok: true, stats: scanLimiter.getStats() })
+);
 
 app.get('/api/agent/status', (_request, response) => {
   const configured = isFoundryConfigured();
@@ -619,10 +812,22 @@ app.post('/api/agent/plan', async (request, response) => {
   }
 });
 
-app.post('/api/scan', async (request, response) => {
+app.post('/api/scan', scanLimiter.rateLimitMiddleware(), async (request, response) => {
+  let releaseSlot: (() => void) | undefined;
   try {
+    releaseSlot = await scanLimiter.acquire();
     const url = validateUrlSyntax(request.body?.url);
-    const scanResult = await scanWebsite(url);
+    const options: ScanOptions = {
+      viewport:
+        request.body?.viewport === 'mobile'
+          ? 'mobile'
+          : request.body?.viewport === 'tablet'
+            ? 'tablet'
+            : 'desktop',
+      autoScroll: Boolean(request.body?.autoScroll),
+    };
+
+    const scanResult = await scanWebsite(url, options);
     const scanId = scanStore.store(scanResult);
     response.json({ ...scanResult, scanId });
   } catch (error) {
@@ -643,6 +848,77 @@ app.post('/api/scan', async (request, response) => {
       suggestion,
       status,
     });
+  } finally {
+    releaseSlot?.();
+  }
+});
+
+app.post('/api/crawl', scanLimiter.rateLimitMiddleware(), async (request, response) => {
+  let releaseSlot: (() => void) | undefined;
+  try {
+    releaseSlot = await scanLimiter.acquire();
+    const url = validateUrlSyntax(request.body?.url);
+    const maxPages = Number(request.body?.maxPages) || 3;
+    const options: ScanOptions = {
+      viewport:
+        request.body?.viewport === 'mobile'
+          ? 'mobile'
+          : request.body?.viewport === 'tablet'
+            ? 'tablet'
+            : 'desktop',
+      autoScroll: Boolean(request.body?.autoScroll),
+    };
+
+    const crawlResult = await crawlWebsite(url, maxPages, options);
+    const scanId = scanStore.store({
+      scannedUrl: crawlResult.startingUrl,
+      scannedAt: crawlResult.scannedAt,
+      counts: {
+        violations: crawlResult.overallScore.totalViolations,
+        passes: crawlResult.overallScore.totalPasses,
+        incomplete: 0,
+      },
+      violations: crawlResult.pages.flatMap((p) => p.violations),
+      passes: crawlResult.pages.flatMap((p) => p.passes),
+      incomplete: crawlResult.pages.flatMap((p) => p.incomplete),
+      source: 'website',
+      score: {
+        score: crawlResult.overallScore.score,
+        grade: crawlResult.overallScore.grade,
+        rating: crawlResult.overallScore.rating,
+        complianceRate: Math.round(
+          (crawlResult.overallScore.totalPasses /
+            Math.max(crawlResult.overallScore.totalEvaluated, 1)) *
+            100
+        ),
+        totalEvaluated: crawlResult.overallScore.totalEvaluated,
+        affectedElements: crawlResult.overallScore.affectedElements,
+        impacts: crawlResult.overallScore.impacts,
+      },
+      viewport: crawlResult.viewport,
+    });
+
+    response.json({ ...crawlResult, scanId });
+  } catch (error) {
+    console.error('Crawl error:', error);
+    const known = error instanceof ScanError;
+    const status = known ? error.status : 500;
+    const message = known
+      ? error.message
+      : error instanceof Error
+        ? error.message
+        : 'The multi-page crawl could not be completed. Please try again.';
+    const code = known ? error.code : 'SERVER_ERROR';
+    const suggestion = known ? error.suggestion : 'Please verify the URL and try again.';
+
+    response.status(status).json({
+      error: message,
+      code,
+      suggestion,
+      status,
+    });
+  } finally {
+    releaseSlot?.();
   }
 });
 

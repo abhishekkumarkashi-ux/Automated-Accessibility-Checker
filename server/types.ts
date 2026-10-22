@@ -28,6 +28,7 @@ export interface ScanResponse {
   incomplete: ScanResultItem[];
   source: 'website' | 'demo';
   score: AuditScore;
+  viewport?: 'desktop' | 'mobile' | 'tablet';
 }
 
 export interface RemediationFinding {

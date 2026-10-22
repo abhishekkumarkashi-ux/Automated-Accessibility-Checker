@@ -139,6 +139,51 @@ export function validateUrlSyntax(raw: unknown): URL {
     );
   }
 
+  // Restrict to standard web ports to prevent internal service probing (e.g. redis, postgres, ssh)
+  if (url.port) {
+    const portNum = Number(url.port);
+    const allowedPorts = [80, 443, 8080, 8443];
+    if (!allowedPorts.includes(portNum)) {
+      throw new ScanError(
+        `Port ${portNum} is restricted. Only standard web ports (80, 443, 8080, 8443) can be scanned.`,
+        400,
+        'BLOCKED_ACCESS',
+        'Scans are restricted to standard web ports to prevent internal infrastructure probing.'
+      );
+    }
+  }
+
+  // Detect and reject obfuscated numeric (decimal, hex, octal) IP formats
+  if (/^\d+$/.test(hostname)) {
+    // Dword decimal integer IP (e.g., 2130706433 for 127.0.0.1)
+    const num = Number(hostname);
+    if (!Number.isNaN(num) && num >= 0 && num <= 0xffffffff) {
+      const ip = `${(num >>> 24) & 255}.${(num >>> 16) & 255}.${(num >>> 8) & 255}.${num & 255}`;
+      if (!isPublicIp(ip)) {
+        throw new ScanError(
+          `Numeric IP address (${hostname} -> ${ip}) resolves to private network space.`,
+          400,
+          'BLOCKED_ACCESS'
+        );
+      }
+    }
+  }
+
+  if (/^0x[0-9a-f]+$/i.test(hostname)) {
+    // Hex integer IP
+    const num = parseInt(hostname, 16);
+    if (!Number.isNaN(num) && num >= 0 && num <= 0xffffffff) {
+      const ip = `${(num >>> 24) & 255}.${(num >>> 16) & 255}.${(num >>> 8) & 255}.${num & 255}`;
+      if (!isPublicIp(ip)) {
+        throw new ScanError(
+          `Hex IP address (${hostname} -> ${ip}) resolves to private network space.`,
+          400,
+          'BLOCKED_ACCESS'
+        );
+      }
+    }
+  }
+
   if (net.isIP(hostname) && !isPublicIp(hostname)) {
     throw new ScanError(
       `"${hostname}" is a private or reserved IP address and cannot be scanned.`,
@@ -169,9 +214,9 @@ function withTimeout<T>(promise: Promise<T>, milliseconds: number, hostname: str
   });
 }
 
-// In-memory cache for validated public hostnames to avoid redundant DNS lookups
+// In-memory cache for validated public hostnames (short 60s TTL mitigates DNS rebinding risks)
 const dnsCache = new Map<string, { expiresAt: number }>();
-const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+const DNS_CACHE_TTL_MS = 60 * 1000;
 
 export async function validatePublicDestination(url: URL): Promise<void> {
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
