@@ -1141,7 +1141,9 @@ h1, h2, h3, p {
 }
 
 .impact-pill-badge.zero {
-  opacity: 0.45;
+  background: rgba(255, 255, 255, 0.06);
+  color: #94a3b8;
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
 .impact-elements-note {

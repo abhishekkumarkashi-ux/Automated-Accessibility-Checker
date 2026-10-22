@@ -81,7 +81,8 @@ To enable the AI Accessibility Coach:
    ```
 2. Configure your Microsoft Foundry project endpoint and model deployment name in `.env`:
    ```env
-   AZURE_AI_FOUNDRY_PROJECT_ENDPOINT=https://<your-foundry-project-resource>.services.ai.azure.com/api/projects/<project-name>
+   # Endpoint from Azure AI Foundry portal
+   AZURE_AI_FOUNDRY_PROJECT_ENDPOINT=https://<resource>.services.ai.azure.com
    AZURE_AI_FOUNDRY_MODEL_DEPLOYMENT=gpt-4o-mini
    ```
 3. Authenticate with Azure using the Azure CLI:
