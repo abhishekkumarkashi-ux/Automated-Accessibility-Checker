@@ -180,8 +180,10 @@ async function protectBrowser(page: Page): Promise<() => ScanError | undefined> 
       return;
     }
 
-    // Abort media and heavy streaming/tracking to save bandwidth, CPU, and prevent hangs on YouTube/NASA/college portals
+    // Abort images, fonts, media, and heavy tracking to save memory, bandwidth, CPU, and prevent timeouts on Render
     if (
+      resourceType === 'image' ||
+      resourceType === 'font' ||
       resourceType === 'media' ||
       rawUrl.includes('videoplayback') ||
       rawUrl.includes('googlevideo.com') ||
@@ -195,6 +197,7 @@ async function protectBrowser(page: Page): Promise<() => ScanError | undefined> 
       rawUrl.includes('facebook.net') ||
       rawUrl.includes('nopaperforms') ||
       rawUrl.includes('npfs.co') ||
+      rawUrl.includes('mymio.ai') ||
       rawUrl.includes('criteo.') ||
       rawUrl.includes('leadsq') ||
       rawUrl.includes('tawk.to') ||
