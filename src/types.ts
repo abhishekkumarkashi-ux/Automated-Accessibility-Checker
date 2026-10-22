@@ -34,6 +34,7 @@ export interface AuditScore {
 }
 
 export interface ScanReport {
+  scanId?: string;
   scannedUrl: string;
   scannedAt: string;
   counts: Record<Category, number>;
@@ -43,3 +44,45 @@ export interface ScanReport {
   source: 'website' | 'demo';
   score?: AuditScore;
 }
+
+export interface ScanErrorInfo {
+  error: string;
+  code?: string;
+  suggestion?: string;
+  status?: number;
+}
+
+export interface ErrorState {
+  title: string;
+  message: string;
+  suggestion?: string;
+  code?: string;
+  failedUrl?: string;
+}
+
+export interface AgentStatus {
+  configured: boolean;
+  model?: string;
+}
+
+export interface RemediationFinding {
+  ruleId: string;
+  help: string;
+  impact: 'critical' | 'serious' | 'moderate' | 'minor';
+  whyFirst: string;
+  steps: string[];
+  codeExample: string | null;
+  wcagTags: string[];
+  helpUrl: string;
+  affectedElementsCount: number;
+}
+
+export interface RemediationPlan {
+  scanId: string;
+  summary: string;
+  priorityFindings: RemediationFinding[];
+  manualReviewNotes: string;
+  generatedAt: string;
+  model: string;
+}
+

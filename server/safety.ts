@@ -3,11 +3,15 @@ import net from 'node:net';
 
 export class ScanError extends Error {
   readonly status: number;
+  readonly code: string;
+  readonly suggestion?: string;
 
-  constructor(message: string, status = 400) {
+  constructor(message: string, status = 400, code = 'SCAN_FAILED', suggestion?: string) {
     super(message);
     this.name = 'ScanError';
     this.status = status;
+    this.code = code;
+    this.suggestion = suggestion;
   }
 }
 
@@ -49,88 +53,187 @@ function isPublicIp(address: string): boolean {
   return false;
 }
 
-export function validateUrlSyntax(raw: unknown): URL {
-  if (typeof raw !== 'string' || raw.trim().length === 0 || raw.length > 2048) {
-    throw new ScanError('Enter a website URL up to 2,048 characters long.');
+/**
+ * Normalizes user input into a standard URL string with protocol.
+ * Automatically adds 'https://' if protocol is missing (e.g. 'youtube.com' -> 'https://youtube.com').
+ */
+export function normalizeInputUrl(raw: unknown): string {
+  if (typeof raw !== 'string') {
+    throw new ScanError('Enter a website URL up to 2,048 characters long.', 400, 'INVALID_URL');
   }
+
+  let trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > 2048) {
+    throw new ScanError('Enter a website URL up to 2,048 characters long.', 400, 'INVALID_URL');
+  }
+
+  // Remove potential leading/trailing quotes or backticks from copy-pasting
+  trimmed = trimmed.replace(/^["'`]|["'`]$/g, '').trim();
+
+  // If no scheme present (e.g. 'youtube.com' or '//youtube.com')
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    if (trimmed.startsWith('//')) {
+      trimmed = 'https:' + trimmed;
+    } else {
+      trimmed = 'https://' + trimmed;
+    }
+  }
+
+  return trimmed;
+}
+
+export function validateUrlSyntax(raw: unknown): URL {
+  const normalized = normalizeInputUrl(raw);
 
   let url: URL;
   try {
-    url = new URL(raw.trim());
+    url = new URL(normalized);
   } catch {
-    throw new ScanError('That does not look like a valid URL. Include a public website, such as https://example.com.');
+    throw new ScanError(
+      'That does not look like a valid website URL.',
+      400,
+      'INVALID_URL',
+      'Please include a public domain name, such as "youtube.com" or "https://example.com".'
+    );
   }
 
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new ScanError('Only public HTTP and HTTPS websites can be scanned.');
+    throw new ScanError(
+      `Only public HTTP and HTTPS websites can be scanned. (${url.protocol} is not supported)`,
+      400,
+      'INVALID_URL',
+      'Enter an address starting with http:// or https://'
+    );
   }
+
   if (url.username || url.password) {
-    throw new ScanError('URLs with embedded usernames or passwords are not allowed.');
+    throw new ScanError(
+      'URLs with embedded credentials (usernames or passwords) are not allowed.',
+      400,
+      'INVALID_URL'
+    );
   }
+
   if (url.hostname.endsWith('.') || url.hostname === '') {
     url.hostname = url.hostname.replace(/\.+$/, '');
   }
+
   const hostname = url.hostname.toLowerCase();
+
+  // Disallow local, test, or internal names
   if (
-    hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') ||
-    hostname.endsWith('.internal') || hostname.endsWith('.test') || hostname.endsWith('.invalid') ||
-    hostname.endsWith('.home.arpa') || hostname.endsWith('.onion')
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal') ||
+    hostname.endsWith('.test') ||
+    hostname.endsWith('.invalid') ||
+    hostname.endsWith('.home.arpa') ||
+    hostname.endsWith('.onion')
   ) {
-    throw new ScanError('Local and reserved hostnames cannot be scanned. Use a public website.');
+    throw new ScanError(
+      `"${hostname}" is a local or reserved address and cannot be scanned.`,
+      400,
+      'BLOCKED_ACCESS',
+      'Only public internet websites can be audited by AccessScan.'
+    );
   }
+
   if (net.isIP(hostname) && !isPublicIp(hostname)) {
-    throw new ScanError('Private or reserved IP addresses cannot be scanned.');
+    throw new ScanError(
+      `"${hostname}" is a private or reserved IP address and cannot be scanned.`,
+      400,
+      'BLOCKED_ACCESS',
+      'Scanning private network infrastructure is disallowed.'
+    );
   }
+
   return url;
 }
 
-function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, milliseconds: number, hostname: string): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new ScanError('The website host took too long to resolve.', 504)), milliseconds);
+    const timer = setTimeout(
+      () =>
+        reject(
+          new ScanError(
+            `DNS resolution for "${hostname}" timed out.`,
+            504,
+            'TIMEOUT',
+            'The website host took longer than 15 seconds to resolve. Check your connection or verify the URL.'
+          )
+        ),
+      milliseconds
+    );
     promise.then(resolve, reject).finally(() => clearTimeout(timer));
   });
 }
 
-const dnsCache = new Map<string, { expiresAt: number; error?: ScanError }>();
+// In-memory cache for validated public hostnames to avoid redundant DNS lookups
+const dnsCache = new Map<string, { expiresAt: number }>();
 const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 export async function validatePublicDestination(url: URL): Promise<void> {
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   const literalVersion = net.isIP(hostname);
   if (literalVersion) {
-    if (!isPublicIp(hostname)) throw new ScanError('Private or reserved IP addresses cannot be scanned.');
+    if (!isPublicIp(hostname)) {
+      throw new ScanError(
+        `Private or reserved IP address (${hostname}) cannot be scanned.`,
+        400,
+        'BLOCKED_ACCESS'
+      );
+    }
     return;
   }
 
   const now = Date.now();
   const cached = dnsCache.get(hostname);
   if (cached && cached.expiresAt > now) {
-    if (cached.error) throw cached.error;
     return;
   }
 
   let addresses: Array<{ address: string; family: number }>;
   try {
-    addresses = await withTimeout(dns.lookup(hostname, { all: true, verbatim: true }), 5000);
+    // 15-second timeout for DNS lookup prevents false positives on cold DNS lookups
+    addresses = await withTimeout(dns.lookup(hostname, { all: true }), 15_000, hostname);
   } catch (error) {
-    const err = error instanceof ScanError ? error : new ScanError('The website host could not be resolved. Check the URL and try again.', 400);
-    dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS, error: err });
-    throw err;
-  }
-  if (addresses.length === 0) {
-    const err = new ScanError('The website host does not have a public address.');
-    dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS, error: err });
-    throw err;
-  }
-  if (addresses.some(({ address }) => !isPublicIp(address))) {
-    const err = new ScanError('This website resolves to a private or reserved network address and cannot be scanned.');
-    dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS, error: err });
-    throw err;
+    if (error instanceof ScanError) throw error;
+    const msg = error instanceof Error ? error.message : String(error);
+    const isNotFound = /ENOTFOUND|EAI_NONAME|EAI_AGAIN/i.test(msg);
+    throw new ScanError(
+      isNotFound
+        ? `Could not find website host "${hostname}". Please check that the URL is spelled correctly.`
+        : `Could not resolve domain "${hostname}": ${msg}`,
+      400,
+      'DNS_FAILED',
+      'Verify the website name is spelled correctly and is currently accessible on the public web.'
+    );
   }
 
+  if (!addresses || addresses.length === 0) {
+    throw new ScanError(
+      `The website host "${hostname}" does not have any public IP addresses.`,
+      400,
+      'DNS_FAILED',
+      'Check if the domain has active DNS A or AAAA records.'
+    );
+  }
+
+  if (addresses.some(({ address }) => !isPublicIp(address))) {
+    throw new ScanError(
+      `This website resolves to a private or reserved network address and cannot be scanned.`,
+      400,
+      'BLOCKED_ACCESS',
+      'Security restrictions prevent scanning internal or loopback IP ranges.'
+    );
+  }
+
+  // Only cache SUCCESSFUL validations! Never cache transient DNS errors.
   dnsCache.set(hostname, { expiresAt: now + DNS_CACHE_TTL_MS });
 }
 
 export function getPublicSuffixHost(url: URL): string {
   return url.hostname.toLowerCase();
 }
+

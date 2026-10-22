@@ -4,3 +4,11 @@ dist-server/
 playwright-report/
 test-results/
 *.log
+.env
+.env.local
+.env.*.local
+scratch/
+*.pdf
+*.pptx
+.accessscan-ppt-build/
+presentation-output/
